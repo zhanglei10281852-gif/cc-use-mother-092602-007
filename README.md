@@ -12,6 +12,7 @@
 - 配额控制：可保存用户、角色或项目的排队数、运行数和每日提交上限；当前提交路径执行用户配额。
 - 结果版本：每次成功回执保存不可变结果、指标摘要和内容摘要，任务指向当前结果版本。
 - 人工干预：取消、人工重试、优先级调整和批量操作均保留操作者、原因、前后状态和批次标识。
+- 维护排程：记录姿态调整/散热器维护窗口范围与受影响载荷，支持预演、正式启用、临时延长、取消、检查点、分批恢复与逐项异常处理；排空任务挂起为 `held`，恢复时按原优先级与入队承诺归位。
 - 登录与角色：基础管理模块提供管理员初始化、用户、角色、会话和细粒度权限。
 
 ## 运行环境
@@ -51,6 +52,8 @@ curl -sS http://127.0.0.1:8432/api/system/health
 
 计算任务摘要位于 `/api/compute/summary`，模板、配额、提交、领取、回执和人工操作接口统一使用 `/api/compute` 前缀。
 
+维护排程接口位于 `/api/maintenance-scheduling`：创建窗口后可通过 `/windows/{code}/preview` 预演排空计划（不改动任务），`/activate` 正式启用（重复调用幂等），`/extend`、`/cancel` 临时延长或取消，`/restore/begin` 在窗口结束后进入分批恢复，`/items/{id}/checkpoint` 上报运行中任务的检查点，以及 `/items/{id}/skip`、`/items/{id}/restore`、`/items/{id}/checkpoint/failed`、`/items/{id}/restore/failed` 处理逐项异常；`GET /windows/{code}` 返回排空进度、恢复顺序与跳过原因，`GET /audit-events` 查看审计事件，`POST /release-due` 供定时器驱动到期批次释放。
+
 ## 测试
 
 ```bash
@@ -79,6 +82,7 @@ python -m app.cli compute-demo
 ```text
 app/
   compute/         计算模板、配额、任务、结果版本和人工干预
+  scheduling/      维护窗口、排空项、恢复批次与排程审计
   api/             用户、角色、认证、审计和系统管理接口
   core/            时钟、安全、异常和分页能力
   repositories/    通用 SQLite 查询

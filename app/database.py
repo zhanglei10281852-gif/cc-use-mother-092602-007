@@ -252,12 +252,13 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     parameter_digest TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
     idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','held')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
+    drain_window_id INTEGER NOT NULL DEFAULT 0,
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
@@ -293,6 +294,78 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    window_type TEXT NOT NULL CHECK(window_type IN ('attitude_adjust','radiator_maintenance','other')),
+    payloads_json TEXT NOT NULL DEFAULT '[]',
+    drain_strategy TEXT NOT NULL CHECK(drain_strategy IN ('graceful','immediate','pause_new')),
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    planned_ends_at TEXT NOT NULL,
+    grace_period_seconds INTEGER NOT NULL DEFAULT 0 CHECK(grace_period_seconds >= 0),
+    status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','active','extended','recovering','completed','cancelled')),
+    plan_json TEXT NOT NULL DEFAULT '{}',
+    committed_at TEXT,
+    cancelled_at TEXT,
+    completed_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_maintenance_windows_status ON maintenance_windows(status,starts_at);
+
+CREATE TABLE IF NOT EXISTS maintenance_window_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES maintenance_windows(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    item_role TEXT NOT NULL CHECK(item_role IN ('queued','running','succeeded','other')),
+    state TEXT NOT NULL CHECK(state IN ('pending','checkpointing','drained','skipped','checkpoint_failed','restoring','restored','failed')),
+    original_status TEXT NOT NULL DEFAULT '',
+    original_available_at TEXT NOT NULL DEFAULT '',
+    original_priority INTEGER NOT NULL DEFAULT 0,
+    original_lease_owner TEXT NOT NULL DEFAULT '',
+    original_lease_expires_at TEXT NOT NULL DEFAULT '',
+    original_attempt_count INTEGER NOT NULL DEFAULT 0,
+    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+    checkpoint_at TEXT,
+    restore_batch_id INTEGER,
+    restore_seq INTEGER,
+    skip_reason TEXT NOT NULL DEFAULT '',
+    exception_note TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(window_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mw_items_window ON maintenance_window_items(window_id,state,id);
+CREATE INDEX IF NOT EXISTS idx_mw_items_task ON maintenance_window_items(task_id);
+
+CREATE TABLE IF NOT EXISTS maintenance_restore_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES maintenance_windows(id) ON DELETE CASCADE,
+    batch_no INTEGER NOT NULL,
+    release_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','released')),
+    released_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(window_id, batch_no)
+);
+CREATE INDEX IF NOT EXISTS idx_mw_batches_window ON maintenance_restore_batches(window_id,batch_no);
+
+CREATE TABLE IF NOT EXISTS maintenance_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER REFERENCES maintenance_windows(id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    outcome TEXT NOT NULL DEFAULT 'success' CHECK(outcome IN ('success','failure')),
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mw_audit_window ON maintenance_audit_events(window_id,id);
 '''
 
 PERMISSIONS = [
@@ -359,8 +432,56 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _migrate_compute_tasks(connection: sqlite3.Connection) -> None:
+    """旧库补列并放宽 compute_tasks.status 的 CHECK（SQLite 需重建表）。"""
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='compute_tasks'").fetchone()
+    if row is None:
+        return
+    columns = {item[1] for item in connection.execute("PRAGMA table_info(compute_tasks)").fetchall()}
+    if "drain_window_id" not in columns:
+        if "'held'" not in (row[0] or ""):
+            fk_enabled = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    "CREATE TABLE compute_tasks_new ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,"
+                    "project_code TEXT NOT NULL,requested_by TEXT NOT NULL,parameters_json TEXT NOT NULL,"
+                    "parameter_digest TEXT NOT NULL,priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),"
+                    "idempotency_key TEXT NOT NULL,"
+                    "status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','held')),"
+                    "attempt_count INTEGER NOT NULL DEFAULT 0,max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),"
+                    "available_at TEXT NOT NULL,lease_owner TEXT NOT NULL DEFAULT '',lease_expires_at TEXT NOT NULL DEFAULT '',"
+                    "drain_window_id INTEGER NOT NULL DEFAULT 0,current_result_version INTEGER,"
+                    "last_error_code TEXT NOT NULL DEFAULT '',last_error_message TEXT NOT NULL DEFAULT '',"
+                    "version INTEGER NOT NULL DEFAULT 1,started_at TEXT,finished_at TEXT,"
+                    "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+                    "UNIQUE(requested_by, idempotency_key))"
+                )
+                existing = sorted(columns)
+                connection.execute(
+                    f"INSERT INTO compute_tasks_new({','.join(existing)}) SELECT {','.join(existing)} FROM compute_tasks"
+                )
+                connection.execute("DROP TABLE compute_tasks")
+                connection.execute("ALTER TABLE compute_tasks_new RENAME TO compute_tasks")
+                connection.execute("CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at)")
+                connection.execute("CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at)")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.execute("PRAGMA foreign_keys=ON" if fk_enabled else "PRAGMA foreign_keys=OFF")
+        else:
+            connection.execute("ALTER TABLE compute_tasks ADD COLUMN drain_window_id INTEGER NOT NULL DEFAULT 0")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
+    connection = get_connection()
+    _migrate_compute_tasks(connection)
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
         for code, name, resource, action in PERMISSIONS:
