@@ -10,6 +10,7 @@ from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
+from app.maintenance.repository import MaintenanceRepository
 
 
 def digest(value: Any) -> str:
@@ -65,6 +66,7 @@ class ComputeOperationsService:
             self._check_quota(repository, payload["requested_by"], now_value)
             return repository.create_task(
                 template_id=template["id"], project_code=payload["project_code"],
+                payload_code=payload.get("payload_code") or template["code"],
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
                 idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"], now=now,
@@ -88,7 +90,8 @@ class ComputeOperationsService:
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
+            payloads, projects = MaintenanceRepository(connection).active_scopes()
+            candidate = repository.queued_candidate(capabilities, now, exclude_payloads=payloads, exclude_projects=projects)
             if candidate is None:
                 return None
             cursor = connection.execute(
@@ -97,7 +100,21 @@ class ComputeOperationsService:
             )
             if cursor.rowcount != 1:
                 return None
-            return dict(repository.task_by_id(candidate["id"]))
+            claimed = dict(repository.task_by_id(candidate["id"]))
+            checkpoint_row = connection.execute(
+                "SELECT * FROM task_checkpoints WHERE task_id=? ORDER BY sequence DESC LIMIT 1",
+                (candidate["id"],),
+            ).fetchone()
+            if checkpoint_row is not None:
+                claimed["resume_checkpoint"] = {
+                    "id": checkpoint_row["id"],
+                    "window_id": checkpoint_row["window_id"],
+                    "sequence": checkpoint_row["sequence"],
+                    "checkpoint_data": json.loads(checkpoint_row["checkpoint_data_json"]),
+                    "progress_percent": checkpoint_row["progress_percent"],
+                    "created_at": checkpoint_row["created_at"],
+                }
+            return claimed
 
     def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()

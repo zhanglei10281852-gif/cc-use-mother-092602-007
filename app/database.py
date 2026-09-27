@@ -247,12 +247,14 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
     project_code TEXT NOT NULL,
+    payload_code TEXT NOT NULL DEFAULT '',
     requested_by TEXT NOT NULL,
     parameters_json TEXT NOT NULL,
     parameter_digest TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+    queue_ticket INTEGER NOT NULL DEFAULT 0,
     idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','shelved')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     available_at TEXT NOT NULL,
@@ -293,6 +295,92 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    window_type TEXT NOT NULL CHECK(window_type IN ('attitude_adjust','radiator_maintenance','other')),
+    payloads_json TEXT NOT NULL DEFAULT '[]',
+    projects_json TEXT NOT NULL DEFAULT '[]',
+    drain_strategy TEXT NOT NULL CHECK(drain_strategy IN ('graceful','immediate','checkpoint_only')),
+    restore_batch_size INTEGER NOT NULL CHECK(restore_batch_size > 0),
+    restore_interval_seconds INTEGER NOT NULL CHECK(restore_interval_seconds >= 0),
+    restore_order TEXT NOT NULL DEFAULT 'committed' CHECK(restore_order IN ('committed','priority')),
+    planned_start_at TEXT NOT NULL,
+    planned_end_at TEXT NOT NULL,
+    actual_start_at TEXT,
+    actual_end_at TEXT,
+    extended_end_at TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'preview' CHECK(status IN ('preview','active','ending','restoring','completed','cancelled')),
+    drain_completed_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    cancelled_at TEXT,
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    activated_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_window_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES maintenance_windows(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    category TEXT NOT NULL CHECK(category IN ('queued','running','succeeded','failed','cancelled','cancel_requested','new')),
+    drain_state TEXT NOT NULL DEFAULT 'planned' CHECK(drain_state IN ('planned','shelved','completed','failed_terminal','cancelled_terminal','checkpoint_pending','skipped')),
+    restore_state TEXT NOT NULL DEFAULT 'pending' CHECK(restore_state IN ('pending','batched','restored','not_required','skipped','failed')),
+    queue_ticket INTEGER NOT NULL DEFAULT 0,
+    batch_number INTEGER,
+    skip_reason TEXT NOT NULL DEFAULT '',
+    exception_status TEXT NOT NULL DEFAULT '' CHECK(exception_status IN ('','open','resolved')),
+    exception_note TEXT NOT NULL DEFAULT '',
+    snapshot_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(window_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mw_items_window ON maintenance_window_items(window_id,drain_state,restore_state);
+CREATE INDEX IF NOT EXISTS idx_mw_items_task ON maintenance_window_items(task_id);
+CREATE INDEX IF NOT EXISTS idx_mw_items_restore ON maintenance_window_items(window_id,queue_ticket);
+
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    window_id INTEGER NOT NULL REFERENCES maintenance_windows(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    worker_id TEXT NOT NULL DEFAULT '',
+    checkpoint_data_json TEXT NOT NULL DEFAULT '{}',
+    progress_percent REAL,
+    restored_from_id INTEGER,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, window_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON task_checkpoints(task_id,id);
+
+CREATE TABLE IF NOT EXISTS maintenance_restore_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES maintenance_windows(id) ON DELETE CASCADE,
+    batch_number INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','released','done')),
+    planned_at TEXT,
+    released_at TEXT,
+    item_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(window_id, batch_number)
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_window_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES maintenance_windows(id) ON DELETE CASCADE,
+    task_id INTEGER,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mw_events_window ON maintenance_window_events(window_id,id);
 '''
 
 PERMISSIONS = [
@@ -359,10 +447,20 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _apply_column_migrations(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(compute_tasks)").fetchall()}
+    if "queue_ticket" not in columns:
+        connection.execute("ALTER TABLE compute_tasks ADD COLUMN queue_ticket INTEGER NOT NULL DEFAULT 0")
+    if "payload_code" not in columns:
+        connection.execute("ALTER TABLE compute_tasks ADD COLUMN payload_code TEXT NOT NULL DEFAULT ''")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_compute_tasks_ticket ON compute_tasks(status,priority DESC,queue_ticket)")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _apply_column_migrations(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

@@ -12,6 +12,7 @@
 - 配额控制：可保存用户、角色或项目的排队数、运行数和每日提交上限；当前提交路径执行用户配额。
 - 结果版本：每次成功回执保存不可变结果、指标摘要和内容摘要，任务指向当前结果版本。
 - 人工干预：取消、人工重试、优先级调整和批量操作均保留操作者、原因、前后状态和批次标识。
+- 维护排程：记录维护窗口范围（载荷/项目）、排空策略与恢复批次，支持预演、幂等启用、临时延长、取消、检查点排空、按承诺顺序分批恢复、逐项跳过/提前恢复/异常处置和完整审计事件。
 - 登录与角色：基础管理模块提供管理员初始化、用户、角色、会话和细粒度权限。
 
 ## 运行环境
@@ -51,13 +52,43 @@ curl -sS http://127.0.0.1:8432/api/system/health
 
 计算任务摘要位于 `/api/compute/summary`，模板、配额、提交、领取、回执和人工操作接口统一使用 `/api/compute` 前缀。
 
+## 维护排程
+
+卫星姿态调整或散热器维护期间，受影响载荷的计算任务需要有序排空，并在窗口结束后按原有承诺恢复，而不是重新排到队尾。接口统一使用 `/api/maintenance-windows` 前缀：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/maintenance-windows` | 创建窗口（计划起止、受影响 `payloads`/`projects`、排空策略、恢复批次大小/间隔/排序） |
+| `GET /api/maintenance-windows/{code}/preview` | 预演：只读列出受影响任务、排空分类和预计恢复批次，不落库 |
+| `POST /api/maintenance-windows/{code}/activate` | 正式启用；重复启用幂等。早于计划开始时间需 `force=true` |
+| `POST /api/maintenance-windows/{code}/extend` | 临时延长（`extend_seconds` 或 `new_end_at`），恢复批次计划时间随之顺延 |
+| `POST /api/maintenance-windows/{code}/cancel` | 取消窗口；已搁置任务立即按承诺顺序回队，重复取消幂等 |
+| `GET /api/maintenance-windows/{code}/progress` | 排空/恢复计数、待交检查点、未决异常、跳过原因 |
+| `POST /api/maintenance-windows/{code}/checkpoints` | 持单工作者提交检查点，任务随后搁置 |
+| `POST /api/maintenance-windows/{code}/end-drain` | 结束排空并按配置生成恢复批次；有未交检查点时需 `force=true` |
+| `GET /api/maintenance-windows/{code}/restore-plan` | 恢复顺序与各批次明细 |
+| `POST /api/maintenance-windows/{code}/restore-batches/release` | 释放下一批或指定批；`only_due=true` 仅释放已到计划时间的批次 |
+| `POST .../items/{task_id}/skip` | 逐项跳过（排空阶段或恢复阶段），必填原因 |
+| `POST .../items/{task_id}/restore-now` | 逐项提前恢复 |
+| `POST .../items/{task_id}/exceptions`、`.../exceptions/resolve` | 逐项异常登记与处理 |
+| `GET /api/maintenance-windows/{code}/events` | 审计事件，可按 `event_type`、`task_id` 过滤 |
+
+行为约定：
+
+- **承诺顺序**：每个任务创建时获得单调的承诺序号 `queue_ticket`。恢复时默认按该序号回队（`restore_order=committed`），窗口期间新提交的任务序号更大，不会越过被排空的任务；也可选择 `priority` 排序。
+- **终态不回滚**：已成功/失败/取消的任务只登记为终态条目，状态与结果版本不变。
+- **运行中任务**：`graceful` 等待检查点；`immediate` 先置 `cancel_requested` 催促工作者交检查点；`checkpoint_only` 只处理运行中任务，排队任务保持原状、窗口期间仅冻结领取。
+- **检查点续跑**：检查点与窗口、序号、工作者和进度一并保存；任务被恢复并再次领取时，领取响应携带最近的 `resume_checkpoint`。
+- **窗口期间新任务**：活动窗口范围（载荷/项目）内新提交的排队任务不会被领取，并在下次进度对账时自动搁置纳入窗口。
+- **持久化**：窗口、条目、检查点、批次与事件全部写入 SQLite；服务重启后状态一致。
+
 ## 测试
 
 ```bash
 python -m pytest
 ```
 
-测试覆盖参数规则、幂等提交、配额拒绝、优先级领取、能力匹配、租约续期、失败退避、结果版本、取消、人工重试、批量操作和租约恢复，并保留身份与既有科学计算模块的回归用例。
+测试覆盖参数规则、幂等提交、配额拒绝、优先级领取、能力匹配、租约续期、失败退避、结果版本、取消、人工重试、批量操作和租约恢复，以及维护窗口的预演、幂等启用、检查点、排空策略、分批恢复顺序、临时延长、取消、逐项异常、审计事件与重启一致性，并保留身份与既有科学计算模块的回归用例。
 
 ## 编译检查
 
@@ -79,6 +110,7 @@ python -m app.cli compute-demo
 ```text
 app/
   compute/         计算模板、配额、任务、结果版本和人工干预
+  maintenance/     维护窗口、排空条目、检查点、恢复批次和审计事件
   api/             用户、角色、认证、审计和系统管理接口
   core/            时钟、安全、异常和分页能力
   repositories/    通用 SQLite 查询
